@@ -1,0 +1,11 @@
+[package]
+name = "fourlock-windows-service"
+version = "0.1.0"
+edition = "2021"
+description = "Windows service for Hyper-V VM lifecycle and monitoring."
+
+[dependencies]
+windows-service = "0.8"
+log = "0.4"
+simplelog = "0.12"
+ctrlc = "3.4"
