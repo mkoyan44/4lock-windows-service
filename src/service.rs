@@ -5,6 +5,8 @@ use log::info;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+pub const PIPE_NAME: &str = pipe_server::DEFAULT_PIPE_NAME;
+
 /// Runs the named pipe server until `shutdown` is set to true.
 pub fn run_service_work(shutdown: Arc<AtomicBool>) {
     info!("Service work loop started — launching pipe server");

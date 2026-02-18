@@ -123,6 +123,11 @@ fn run_service() -> windows_service::Result<()> {
                         process_id: None,
                     });
                 }
+                // Connect to the pipe to unblock the server's ConnectNamedPipe call
+                let _ = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(service::PIPE_NAME);
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NotImplemented,
