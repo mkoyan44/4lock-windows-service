@@ -26,7 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
 pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\4lock-service";
@@ -78,7 +78,7 @@ fn run_pipe_server_windows(pipe_name: &str, shutdown: Arc<AtomicBool>) {
                 wide_name.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,           // max instances
+                PIPE_UNLIMITED_INSTANCES, // allow recovery if stale handle exists
                 BUFFER_SIZE, // out buffer
                 BUFFER_SIZE, // in buffer
                 1000,        // default timeout ms (for ConnectNamedPipe)
