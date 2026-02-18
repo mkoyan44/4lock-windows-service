@@ -13,6 +13,13 @@ use std::sync::Arc;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(windows)]
+use windows_sys::Win32::Security::{
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR,
+};
+// SECURITY_DESCRIPTOR_REVISION is in Win32::System::SystemServices — just use the constant directly
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
 };
@@ -51,6 +58,19 @@ pub fn run_pipe_server_on(pipe_name: &str, shutdown: Arc<AtomicBool>) {
 fn run_pipe_server_windows(pipe_name: &str, shutdown: Arc<AtomicBool>) {
     let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
+    // Build a security descriptor with a NULL DACL so non-elevated clients can connect
+    // when the service runs as LocalSystem / admin.
+    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    unsafe {
+        InitializeSecurityDescriptor(&mut sd as *mut _ as *mut _, SECURITY_DESCRIPTOR_REVISION);
+        SetSecurityDescriptorDacl(&mut sd as *mut _ as *mut _, 1, std::ptr::null_mut(), 0);
+    }
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: &mut sd as *mut _ as *mut _,
+        bInheritHandle: 0,
+    };
+
     while !shutdown.load(Ordering::Relaxed) {
         // Create a new pipe instance for each connection
         let pipe = unsafe {
@@ -62,7 +82,7 @@ fn run_pipe_server_windows(pipe_name: &str, shutdown: Arc<AtomicBool>) {
                 BUFFER_SIZE, // out buffer
                 BUFFER_SIZE, // in buffer
                 1000,        // default timeout ms (for ConnectNamedPipe)
-                std::ptr::null_mut(),
+                &mut sa as *mut _ as *mut _,
             )
         };
 
