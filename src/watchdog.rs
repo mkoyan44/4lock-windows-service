@@ -1,11 +1,15 @@
-//! Watchdog: monitors the 4lock-agent process and cleans up Hyper-V VMs on exit.
+//! Watchdog: monitors the 4lock-agent process and cleans up on exit.
 //!
 //! The watchdog runs in a background thread and:
 //! 1. Polls for `vapp.exe` by name (every 5 seconds)
 //! 2. Once found, opens a process handle and waits for it to exit
-//! 3. On exit, discovers owned VMs from user profile directories and removes them
-//! 4. On service stop, performs one final VM cleanup
+//! 3. On exit, performs full cleanup:
+//!    a. Discovers owned VMs from user profile directories and removes them
+//!    b. Resets DNS to DHCP on common adapters (prevents internet loss)
+//!    c. Kills processes holding docker-proxy ports (5050/5051)
+//! 4. On service stop, performs one final cleanup pass
 
+use crate::commands::dns;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -55,15 +59,15 @@ pub fn run_watchdog(shutdown: Arc<AtomicBool>) {
             break;
         }
 
-        // Process exited — clean up VMs
-        info!("[Watchdog] Agent process exited — cleaning up Hyper-V VMs");
-        cleanup_owned_vms();
+        // Process exited — full cleanup
+        info!("[Watchdog] Agent process exited — running full cleanup");
+        run_full_cleanup();
         info!("[Watchdog] Cleanup complete, resuming monitoring");
     }
 
     // Final cleanup on service stop
-    info!("[Watchdog] Shutdown — running final VM cleanup");
-    cleanup_owned_vms();
+    info!("[Watchdog] Shutdown — running final cleanup");
+    run_full_cleanup();
     info!("[Watchdog] Stopped");
 }
 
@@ -314,6 +318,128 @@ Write-Output 'REMOVED'
 }
 
 // ---------------------------------------------------------------------------
+// Full cleanup orchestration
+// ---------------------------------------------------------------------------
+
+/// Run all cleanup steps in order after agent death or service shutdown.
+fn run_full_cleanup() {
+    cleanup_owned_vms();
+    cleanup_dns();
+    cleanup_ports();
+}
+
+// ---------------------------------------------------------------------------
+// DNS cleanup
+// ---------------------------------------------------------------------------
+
+/// Reset DNS to DHCP on common network adapters.
+///
+/// When VPN is active, the host DNS is pointed at the VM's eth0 IP. If the VM
+/// is removed but DNS isn't reset, the user loses all DNS resolution. This
+/// resets DNS to DHCP on Wi-Fi and Ethernet adapters (best-effort).
+fn cleanup_dns() {
+    for adapter in ["Wi-Fi", "Ethernet"] {
+        let resp = dns::clear_dns(Some(adapter));
+        if resp.success {
+            info!("[Watchdog] DNS cleared on {} (DHCP)", adapter);
+        }
+        // Ignore errors — adapter may not exist on this system
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Port cleanup (docker-proxy 5050/5051)
+// ---------------------------------------------------------------------------
+
+/// Kill any processes still listening on docker-proxy ports 5050/5051.
+///
+/// BlobService (docker-proxy) runs inside vapp.exe and normally dies with it,
+/// but child processes could outlive the parent and hold ports.
+fn cleanup_ports() {
+    let ports = [5050u16, 5051];
+    let pids = find_pids_on_ports(&ports);
+
+    if pids.is_empty() {
+        info!("[Watchdog] No processes holding docker-proxy ports 5050/5051");
+        return;
+    }
+
+    info!(
+        "[Watchdog] Found {} process(es) on docker-proxy ports: {:?}",
+        pids.len(),
+        pids
+    );
+
+    for pid in &pids {
+        kill_process(*pid);
+    }
+}
+
+/// Find PIDs of processes listening on the given ports via `netstat -ano`.
+fn find_pids_on_ports(ports: &[u16]) -> Vec<u32> {
+    let mut pids = Vec::new();
+
+    let output = match std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            warn!(
+                "[Watchdog] netstat failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return pids;
+        }
+        Err(e) => {
+            warn!("[Watchdog] Failed to run netstat: {}", e);
+            return pids;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        for &port in ports {
+            let port_str = format!(":{}", port);
+            if line.contains(&port_str) && line.contains("LISTENING") {
+                if let Some(pid_str) = line.split_whitespace().last() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid != 0 && !pids.contains(&pid) {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pids
+}
+
+/// Force-kill a process by PID using `taskkill /F /PID`.
+fn kill_process(pid: u32) {
+    match std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!("[Watchdog] Killed process {} on docker-proxy port", pid);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "[Watchdog] Failed to kill process {}: {}",
+                pid,
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            warn!("[Watchdog] Failed to run taskkill for PID {}: {}", pid, e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -355,5 +481,19 @@ mod tests {
         if let Some(pid) = result {
             assert!(pid > 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_find_pids_on_ports_no_crash() {
+        // Should not crash regardless of what's listening
+        let pids = find_pids_on_ports(&[5050, 5051]);
+        let _ = pids;
+    }
+
+    #[test]
+    fn test_cleanup_dns_no_crash() {
+        // Should not crash even if adapters don't exist
+        cleanup_dns();
     }
 }
